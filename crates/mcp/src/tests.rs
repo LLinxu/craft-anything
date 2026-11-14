@@ -44,7 +44,7 @@ fn response(out: &[Value], id: u64) -> Value {
 #[test]
 fn approval_tool_answers_in_the_permission_prompt_shape() {
     let out = run(&[
-        req(1, "tools/call", json!({"name": "core_action_approve", "arguments": {"tool_name": "Read", "input": {"file_path": "x"}, "tool_use_id": "t"}})),
+        req(1, "tools/call", json!({"name": "core_action_approve", "arguments": {"tool_name": "TodoWrite", "input": {"todos": []}, "tool_use_id": "t"}})),
         req(2, "tools/call", json!({"name": "core_action_approve", "arguments": {"input": {}}})),
     ]);
     for id in [1, 2] {
@@ -58,7 +58,7 @@ fn approval_tool_answers_in_the_permission_prompt_shape() {
         assert!(decision["behavior"] == "allow" || decision["behavior"] == "deny", "{decision}");
     }
     let ok: Value = serde_json::from_str(response(&out, 1)["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(ok, json!({"behavior": "allow", "updatedInput": {"file_path": "x"}}));
+    assert_eq!(ok, json!({"behavior": "allow", "updatedInput": {"todos": []}}));
     let bad: Value = serde_json::from_str(response(&out, 2)["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(bad["behavior"], "deny", "a malformed request is refused in the protocol's own words");
 }
@@ -66,10 +66,10 @@ fn approval_tool_answers_in_the_permission_prompt_shape() {
 /// #253: an allowed action with a large input came back as an `over_limit` error with no decision.
 #[test]
 fn a_large_approval_keeps_its_decision() {
-    let input = json!({"file_path": "x", "note": "a".repeat(4096)});
+    let input = json!({"todos": [], "note": "a".repeat(4096)});
     let out = run_with(
         ServerOptions { max_response_bytes: 300, ..Default::default() },
-        &[req(1, "tools/call", json!({"name": "core_action_approve", "arguments": {"tool_name": "Read", "input": input, "tool_use_id": "t"}}))],
+        &[req(1, "tools/call", json!({"name": "core_action_approve", "arguments": {"tool_name": "TodoWrite", "input": input, "tool_use_id": "t"}}))],
     );
     let r = response(&out, 1)["result"].clone();
     assert_eq!(r["isError"], false, "{r}");
