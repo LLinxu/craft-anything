@@ -648,6 +648,22 @@ a limit, so the path chosen for hostile input was the one that could grow. Apply
 every push on every path, record the list in `truncated` where the parsed path does, and test the
 fallback with more calls than the cap permits.
 
+**A nesting guard missed the shapes it exists for.** The JavaScript nesting estimate counted
+brackets and some keywords, but an `else if` chain lost its depth at every `;`, `extends` and a run
+of prefix `++` counted nothing, and the tokenizer read `/` after `++`, after a member name or after
+`yield` as a regex, hiding the brackets in the text after it. The `;` that ended each link lost the
+chain depth when a comma expression came before it, a `;` inside a block consequent reset the chain
+the block belonged to, and a regex after `yield` needs its brackets and prefix-operator runs counted
+too, since the same text is division in sloppy code. Sources that estimated one or two levels then
+overflowed the parser thread's stack and aborted the process. Count the `else` links at their own
+scope, read a `yield /…/` as both a regex (for the fallback's facts) and possible code (for the
+guard) with lookahead bounded across the source, ended by every line terminator (an escaped one
+included), failing closed when its budget runs out, when a quote or backtick inside it starts a
+string in sloppy code, when its closing slash would open a comment or a later token would differ
+between the regex and division readings, and keeping the division reading's operator depth in the
+expression so later nesting adds to it; test that a deep source reaches the lexer fallback with a
+nesting reason instead of being parsed.
+
 **An occurrence label was also a binding name.** The second `obj.x` window and the first
 `obj["x[2]"]` window both appeared as `obj.x[2]`. Reserve literal labels and use a separate
 disambiguator for collisions; never change the occurrence index to make a label unique. Include
