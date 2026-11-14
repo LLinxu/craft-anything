@@ -99,3 +99,54 @@ so we don't do it.
 Startup tool discovery was verified with Codex CLI 0.166.0, a loopback model and the real MCP server:
 Codex received 107 Clean-room-permitted tools, including non-Core tools, while Deep-only tools stayed
 hidden. No real-account build was run.
+
+## Continuing a Codex session
+
+The adapter saves Codex's reported thread id and uses `codex exec resume <id>` for
+later turns, including a project reopened with its saved agent session. The run's
+model, sandbox and MCP configuration are passed again. Exec-only flags stay before
+the `resume` subcommand, the id is protected as positional data, and the prompt
+continues to arrive on stdin. It never selects the most recent unrelated session.
+
+Argument regressions and a local stand-in program cover a fresh turn, a second
+turn and reopening a saved conversation. To explicitly check an installed Codex
+against a real account, build the CLI and run the manual example:
+
+```sh
+cargo build -p craft-anything-cli
+PATH="$PWD/target/debug:$PATH" cargo run -p craft-anything-ai --example codex_resume_smoke -- <model>
+```
+
+The model argument is optional. The example uses the installed Codex's sign-in
+and model allowance; it is not part of automated tests. It ignores Codex's user
+configuration for this check, calls the real `core_targets_list` MCP tool, creates
+one file in a temporary workspace using the workspace-write sandbox, then verifies
+both an in-memory follow-up and a reopened conversation keep the thread and marker.
+The temporary workspace is removed afterwards; Codex keeps its usual session record.
+It does not test a complete Study → Build → Check → Ready project or GUI behavior.
+
+This check passed on macOS with Codex CLI 0.169.0-alpha.11.1 and `gpt-6.1-sol`
+on 2026-11-14, using an existing ChatGPT sign-in.
+
+Resume argument order (including `--sandbox` before `resume`) has been live-checked
+only on Codex 0.169.0-alpha.11.1. Older releases, including 0.167, have not been
+verified with this adapter; passing `--sandbox` after `resume` is not supported by
+the checked CLI. The overlapping PR #1805 reports a config-override approach on 0.167.
+
+A missing saved thread is reported on stderr as `no rollout found for thread id`.
+The adapter marks the session missing, clears the saved id and explains that asking
+again starts a fresh conversation. Other stderr failures do not clear the session.
+To include this recovery in the manual live check, append `--missing-thread` after
+the model argument. It first tries a deliberately nonexistent id and then runs
+the normal fresh-turn, follow-up and reopened-session checks.
+This extended check passed with 0.169.0-alpha.11.1 on macOS on 2026-11-14.
+
+The native adapter refuses a backend's `--worktree` option before starting any turn,
+because Codex 0.169 rejects it with resume. Select an existing worktree's folder as
+the project folder instead.
+
+The native adapter also refuses `--ephemeral` before starting a turn: Codex does
+not persist those conversations, so their reported ids cannot be resumed later.
+Remove that option to use the project's saved conversation. A two-turn subprocess
+regression checks that both attempts explain the refusal, start no Codex process
+and save no session id.

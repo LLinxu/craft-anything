@@ -163,6 +163,10 @@ pub trait AgentAdapter: Send + Sync {
     fn parse(&self, _p: &mut StreamParser, _v: &Value) -> Vec<AgentEvent> {
         Vec::new()
     }
+    /// Diagnostics that an agent reports outside its JSON stream.
+    fn parse_stderr(&self, _p: &mut StreamParser, _line: &str) -> Vec<AgentEvent> {
+        Vec::new()
+    }
     /// It can continue a saved session.
     fn resumes(&self) -> bool {
         false
@@ -817,6 +821,36 @@ impl AgentAdapter for Codex {
         &["codex"]
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
+    fn check_native_options(&self, options: &BackendOptions, _cwd: Option<&Path>) -> Result<(), ToolError> {
+        if options.args.iter().any(|arg| arg == "--ephemeral") {
+            return Err(ToolError::invalid("Codex's --ephemeral option does not save conversations for later turns.")
+                .with_remediation("Remove --ephemeral from this backend's arguments so Craft Anything can resume the project's conversation."));
+        }
+        if options.args.iter().any(|arg| arg == "--worktree") {
+            return Err(ToolError::invalid("Codex's --worktree option cannot continue this project's saved conversation.").with_remediation(
+                "Remove --worktree from this backend's arguments. To work in a worktree, select its existing folder as the project folder.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_stderr(&self, p: &mut StreamParser, line: &str) -> Vec<AgentEvent> {
+        let diagnostic = line.trim().to_ascii_lowercase();
+        if p.session_missing || !diagnostic.starts_with("error:") || !diagnostic.contains("no rollout found for thread id ") {
+            return Vec::new();
+        }
+        p.session_missing = true;
+        vec![AgentEvent::Error {
+            message: "Codex's earlier conversation about this project isn't on this computer.".into(),
+            remediation: Some("Ask again: a new conversation starts from what the project already has.".into()),
+            log: None,
+        }]
+    }
+
     /// Ask the selected CLI, not its auth file or keychain; discard raw status output.
     fn signed_in(&self, program: &str) -> Option<bool> {
         let out = Process::new(program).args(["login", "status"]).timeout(Duration::from_secs(10)).stdout_cap(16 * 1024).run().ok()?;
@@ -875,6 +909,11 @@ impl AgentAdapter for Codex {
             v.extend(["-m".into(), m.clone()]);
         }
         v.extend(cx.options.args.iter().cloned());
+        // Exec-only flags (notably --sandbox) stay before the resume subcommand.
+        // The saved thread id is positional data, never another CLI option.
+        if let Some(id) = cx.resume {
+            v.extend(["resume".into(), "--".into(), id.into()]);
+        }
         // The message itself goes in on stdin (see `stdin_text`).
         v.push("-".into());
         v

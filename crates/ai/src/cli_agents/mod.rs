@@ -1066,6 +1066,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let (held2, agent2, program2, host2) = (held.clone(), agent.clone(), program.clone(), remote.clone());
     let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
     let (p2, tx2, tx_err, lost2, failure2) = (parser.clone(), tx.clone(), tx.clone(), lost.clone(), failure.clone());
+    let (stderr_parser, stderr_lost) = (parser.clone(), lost.clone());
     let failed_tools = Arc::new(AtomicBool::new(false));
     let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
     let stop2 = stop.clone();
@@ -1119,6 +1120,16 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             }
         })
         .on_stderr_line(move |l| {
+            let mut p = stderr_parser.lock().unwrap_or_else(PoisonError::into_inner);
+            let adapter = p.adapter.clone();
+            let events = adapter.parse_stderr(&mut p, l);
+            if p.session_missing {
+                stderr_lost.store(true, Ordering::SeqCst);
+            }
+            drop(p);
+            for event in events {
+                let _ = tx_err.send(event);
+            }
             if !l.trim().is_empty() {
                 let _ = tx_err.send(AgentEvent::Output { text: l.to_string() });
             }
@@ -2043,6 +2054,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_resume_keeps_run_configuration_and_reads_prompt_from_stdin() {
+        let codex = adapter_for("codex");
+        assert!(codex.resumes());
+        let options =
+            BackendOptions { cli_model: Some("test-model".into()), args: vec!["-c".into(), "model_reasoning_effort=\"low\"".into()], ..Default::default() };
+        for access in [Access::Analyse, Access::Build] {
+            let fresh = build_args(codex.as_ref(), &options, "first", "P:", &mcp(), None, access);
+            let resumed = build_args(codex.as_ref(), &options, "follow-up", "P:", &mcp(), Some("saved-thread"), access);
+            let mut expected = fresh;
+            expected.pop();
+            expected.extend(["resume".into(), "--".into(), "saved-thread".into(), "-".into()]);
+            assert_eq!(resumed, expected, "resume keeps model, sandbox and MCP configuration");
+            assert_eq!(codex.stdin_text("P:", "follow-up"), "P:follow-up");
+        }
+        let args = build_args(codex.as_ref(), &options, "q", "", &mcp(), Some("--last"), Access::Build);
+        assert!(args.windows(4).any(|w| w == ["resume", "--", "--last", "-"]), "a saved id cannot select another thread");
+    }
+
+    #[test]
     fn gemini_long_prompt_goes_in_on_stdin() {
         // npm starts Gemini CLI through `gemini.cmd`, where cmd.exe allows 8,191 characters.
         let gemini = adapter_for("gemini-cli");
@@ -2661,6 +2691,166 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         }
     }
 
+    #[test]
+    fn codex_missing_thread_diagnostics_are_specific() {
+        let adapter = adapter_for("codex");
+        for diagnostic in ["Error: network timeout", "Error: thread/resume: authentication failed", "warning: no rollout found for thread id example"] {
+            let mut p = StreamParser::new(adapter.clone());
+            assert!(adapter.parse_stderr(&mut p, diagnostic).is_empty());
+            assert!(!p.session_missing);
+        }
+        for diagnostic in [
+            "Error: no rollout found for thread id missing",
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id missing (code -32600)",
+        ] {
+            let mut p = StreamParser::new(adapter.clone());
+            assert!(
+                matches!(adapter.parse_stderr(&mut p, diagnostic).as_slice(), [AgentEvent::Error { remediation: Some(fix), .. }] if fix.contains("Ask again"))
+            );
+            assert!(p.session_missing);
+            assert!(adapter.parse_stderr(&mut p, diagnostic).is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_refuses_worktree_before_starting_a_conversation() {
+        let adapter = adapter_for("codex");
+        let options = BackendOptions { args: vec!["--worktree".into()], ..Default::default() };
+        let error = adapter.check_native_options(&options, None).unwrap_err();
+        assert!(error.message.contains("--worktree"));
+        assert!(error.remediation.as_deref().unwrap_or_default().contains("existing folder"));
+        assert!(adapter.check_native_options(&BackendOptions::default(), None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_ephemeral_is_refused_on_two_turns_without_starting_a_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nd=$(dirname \"$0\")\ntouch \"$d/started\"\necho '{\"type\":\"thread.started\",\"thread_id\":\"not-persisted\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), args: vec!["--ephemeral".into()], ..Default::default() };
+        let mut c = CliConversation::new(CliSpec::new(config, options, false, None));
+        for prompt in ["first turn", "follow-up turn"] {
+            c.send(prompt);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            while std::time::Instant::now() < deadline && !events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                events.extend(c.poll());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            c.stop();
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })), "{events:?}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { message, remediation: Some(fix), .. } if message.contains("--ephemeral") && fix.contains("Remove --ephemeral"))), "{events:?}");
+            assert_eq!(c.session_id(), None, "no unpersisted thread can be saved for resume");
+            assert!(!dir.path().join("started").exists(), "even preflight must not start Codex");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_unknown_thread_is_cleared_and_the_next_turn_starts_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+d=$(dirname "$0")
+if [ "$2" = "--help" ]; then echo "--json"; exit 0; fi
+printf '%s\n' "$@" > "$d/argv"
+cat > "$d/stdin"
+for arg in "$@"; do
+  if [ "$arg" = missing-thread ]; then
+    echo 'Error: thread/resume: thread/resume failed: no rollout found for thread id missing-thread (code -32600)' >&2
+    exit 1
+  fi
+done
+echo '{"type":"thread.started","thread_id":"new-thread"}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        spec.resume = Some("missing-thread".into());
+        let mut c = CliConversation::new(spec);
+        for missing in [true, false] {
+            c.send("the original request");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut events = Vec::new();
+            while std::time::Instant::now() < deadline && !events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                events.extend(c.poll());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            c.stop();
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })), "{events:?}");
+            assert_eq!(c.session_lost(), missing);
+            assert_eq!(c.session_id().as_deref(), if missing { None } else { Some("new-thread") });
+            assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Error { .. })).count(), usize::from(missing));
+            let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+            assert_eq!(argv.lines().any(|arg| arg == "resume"), missing);
+        }
+    }
+
+    /// A reported Codex thread is used on the next turn and after reopening the conversation.
+    #[cfg(unix)]
+    #[test]
+    fn codex_resumes_reported_and_saved_threads_through_the_runner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+d=$(dirname "$0")
+if [ "$2" = "--help" ]; then echo "--json"; exit 0; fi
+printf '%s\n' "$@" > "$d/argv"
+cat > "$d/stdin"
+echo '{"type":"thread.started","thread_id":"saved-thread"}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        spec.preamble = Some("P:".into());
+        let mut c = CliConversation::new(spec.clone());
+        let finish = |c: &mut CliConversation, prompt: &str| {
+            c.send(prompt);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut all = Vec::new();
+            while std::time::Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                all.extend(c.poll());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            c.stop();
+            assert!(all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })), "{all:?}");
+            assert!(!all.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{all:?}");
+            assert_eq!(c.session_id().as_deref(), Some("saved-thread"));
+            assert_eq!(std::fs::read_to_string(dir.path().join("stdin")).unwrap(), format!("P:{prompt}"));
+            std::fs::read_to_string(dir.path().join("argv")).unwrap()
+        };
+        let first = finish(&mut c, "first");
+        assert!(!first.lines().any(|a| a == "resume"));
+        let next = finish(&mut c, "second");
+        assert!(next.ends_with("resume\n--\nsaved-thread\n-\n"), "{next}");
+        spec.resume = c.session_id();
+        drop(c);
+        let reopened = finish(&mut CliConversation::new(spec), "third");
+        assert!(reopened.ends_with("resume\n--\nsaved-thread\n-\n"), "{reopened}");
+    }
+
     /// #528, on every platform: the Codex command line stays short, and a child process started
     /// with a message longer than Windows' 32,767-character limit gets all of it on stdin. The
     /// child is this test binary, running `stdin_echo_child`.
@@ -3160,7 +3350,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         assert!(matches!(p.line(r#"{"say":"hello"}"#).as_slice(), [AgentEvent::TextDelta { text }] if text == "hello"));
         // Unknown agents stream their output as text; the built-ins keep their own adapters.
         assert!(!reg.for_agent("no-such-agent").streams_json());
-        assert!(reg.for_agent("claude").resumes() && !reg.for_agent("codex").resumes() && reg.for_agent("antigravity").resumes());
+        assert!(reg.for_agent("claude").resumes() && reg.for_agent("codex").resumes() && reg.for_agent("antigravity").resumes());
         // Registering an adapter for an existing id replaces that one.
         reg.register(Arc::new(EchoAgent));
         assert_eq!(
