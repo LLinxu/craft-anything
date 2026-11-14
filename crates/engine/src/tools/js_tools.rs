@@ -484,26 +484,35 @@ fn js_app_map(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError>
 
 /// Read an application graph from evidence or analyse a path. Returns the graph and the evidence id.
 pub(crate) fn load_graph(ctx: &Ctx<'_>, v: &Value) -> Result<(AppGraph, Option<String>), ToolError> {
+    let (g, id, _) = load_graph_with_limitations(ctx, v)?;
+    Ok((g, id))
+}
+
+/// [`load_graph`] with the limitations that apply to the graph: the path analysis's, or the saved
+/// evidence's (the full re-analysis's when a paged record had to be expanded).
+pub(crate) fn load_graph_with_limitations(ctx: &Ctx<'_>, v: &Value) -> Result<(AppGraph, Option<String>, Vec<Limitation>), ToolError> {
     if let Some(path) = is_path_input(v) {
-        let (g, _, _, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
-        return Ok((g, None));
+        let (g, _, lims, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
+        return Ok((g, None, lims));
     }
     let ev = resolve_evidence_input(ctx, v, &["js_app_map"])?;
     let total = ev.result.get("modules_total").and_then(Value::as_u64).unwrap_or(0);
     let shown = ev.result.get("modules").and_then(Value::as_array).map_or(0, Vec::len) as u64;
     let mut g: AppGraph =
         serde_json::from_value(ev.result.clone()).map_err(|e| ToolError::invalid(format!("evidence {} does not hold an application graph: {e}", ev.id)))?;
+    let mut lims = ev.limitations.clone();
     if shown < total {
         // A paged record: re-analyse the recorded input for the full module list.
         if let Some(path) = ev.params.get("input_path").and_then(Value::as_str) {
-            let (full, _, _, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
+            let (full, _, full_lims, _) = analyze_to_graph(ctx, &AnalyzeParams::for_path(path))?;
             if full.graph_id != g.graph_id {
                 return Err(ToolError::new(ErrorCode::FileChanged, format!("{path} changed since evidence {} was recorded", ev.id)));
             }
             g = full;
+            lims = full_lims;
         }
     }
-    Ok((g, Some(ev.id)))
+    Ok((g, Some(ev.id), lims))
 }
 
 // ---------------------------------------------------------------------------------------------

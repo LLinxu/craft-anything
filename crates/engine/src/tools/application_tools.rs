@@ -6,7 +6,7 @@
 use super::artifact_tools::{
     WalkOptions, abs_path, env, inventory_path, is_path_input, recorded_inventory, resolve_evidence_input, skipped_gitignores_limitation, walk_dir,
 };
-use super::js_tools::load_graph;
+use super::js_tools::{load_graph, load_graph_with_limitations};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_analysis::js_inventory::{InvLimits, Inventory};
 use craft_anything_analysis::js_ledger::{Binding, Review, build_ledger, evaluate_coverage};
@@ -129,6 +129,11 @@ fn with_links(mut b: EvidenceBuilder, ids: impl IntoIterator<Item = Option<Strin
         b = b.link(id);
     }
     b
+}
+
+/// A side's analysis limitations, labelled so a pair's reader knows which side they belong to.
+fn side_limitations(side: &str, lims: Vec<Limitation>) -> Vec<Limitation> {
+    lims.into_iter().map(|l| Limitation::new(l.code, format!("{side}: {}", l.message))).collect()
 }
 
 fn app_subject(label: &str) -> Subject {
@@ -323,9 +328,9 @@ pub struct PairParams {
 
 fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: PairParams = parse_params(params)?;
-    let (l, lid) = load_graph(ctx, &p.left)?;
+    let (l, lid, llims) = load_graph_with_limitations(ctx, &p.left)?;
     ctx.cancel.check()?;
-    let (r, rid) = load_graph(ctx, &p.right)?;
+    let (r, rid, rlims) = load_graph_with_limitations(ctx, &p.right)?;
     let d = js_compare::compare_versions(&l, &r);
     let rows_capped = d["rows_capped"].as_bool().unwrap_or(false);
     let summary = format!(
@@ -353,7 +358,9 @@ fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     .limitation(Limitation::new(
         "tiered_matching",
         "Modules match by path, then identical content, then the same name apart from a bundler's build hash (one on each side; `was` gives the old name), then identical structure; a heavily rewritten module shows as removed + added.",
-    ));
+    ))
+    .limitations(side_limitations("left", llims))
+    .limitations(side_limitations("right", rlims));
     if rows_capped {
         b = b
             .limitation(Limitation::new(
@@ -367,8 +374,8 @@ fn app_graphs_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
 
 fn js_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: PairParams = parse_params(params)?;
-    let (l, lid) = load_graph(ctx, &p.left)?;
-    let (r, rid) = load_graph(ctx, &p.right)?;
+    let (l, lid, llims) = load_graph_with_limitations(ctx, &p.left)?;
+    let (r, rid, rlims) = load_graph_with_limitations(ctx, &p.right)?;
     let d = js_compare::compare_export_outlines(&l, &r);
     let rows_capped = d["rows_capped"].as_bool().unwrap_or(false);
     let summary = format!("{} module(s) compared; {} changed their exports.", d["modules"].as_array().map_or(0, Vec::len), d["changed"]);
@@ -381,7 +388,9 @@ fn js_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     .result(d)
     .summary(summary)
     .confidence(Confidence::Derived)
-    .limitation(Limitation::new("names_only", "Export names and module.exports kind are compared, not function signatures or types."));
+    .limitation(Limitation::new("names_only", "Export names and module.exports kind are compared, not function signatures or types."))
+    .limitations(side_limitations("left", llims))
+    .limitations(side_limitations("right", rlims));
     if rows_capped {
         b = b
             .limitation(Limitation::new("rows_capped", "A module's export diff stops at 2,000 added or removed rows; the totals beside it are complete."))
@@ -1161,6 +1170,64 @@ mod tests {
         assert_eq!(q["links"][0], inv["id"]);
         let h = call(&e, "harmony_app_graph_build", json!({"path": apk})).unwrap();
         assert_eq!(h["confidence"], "inferred");
+    }
+
+    /// A malformed source map on either side stays visible in both comparisons, for path inputs and
+    /// for saved `js_app_map` evidence.
+    #[test]
+    fn comparisons_keep_each_sides_analysis_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = r#"{"name":"maps","main":"main.js"}"#;
+        let write = |root: &std::path::Path| {
+            fx::write_files(
+                root,
+                &[
+                    ("package.json", package.to_string()),
+                    ("main.js", "const x = 1;\n//# sourceMappingURL=main.js.map\n".to_string()),
+                    ("main.js.map", "not a source map".to_string()),
+                ],
+            )
+            .unwrap()
+        };
+        let left = write(&dir.path().join("left"));
+        let right = write(&dir.path().join("right"));
+        let e = Engine::new(crate::testing::session());
+        let assert_sides = |tool: &str, d: &Value| {
+            let lims = d["limitations"].as_array().unwrap();
+            for side in ["left:", "right:"] {
+                assert!(
+                    lims.iter().any(|l| l["code"] == "source_map_unreadable" && l["message"].as_str().unwrap().starts_with(side)),
+                    "{tool} keeps the {side} source-map limitation: {d}"
+                );
+            }
+        };
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let d = call(&e, tool, json!({"left": left.clone(), "right": right.clone()})).unwrap();
+            assert_sides(tool, &d);
+        }
+        let l = call(&e, "js_app_map", json!({"input_path": left})).unwrap();
+        let r = call(&e, "js_app_map", json!({"input_path": right})).unwrap();
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let d = call(&e, tool, json!({"left": retained(&l), "right": retained(&r)})).unwrap();
+            assert_sides(tool, &d);
+        }
+    }
+
+    /// A clean path pair gains no source-map limitation.
+    #[test]
+    fn clean_comparisons_have_no_analysis_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = r#"{"name":"clean","main":"main.js"}"#;
+        let write = |root: &std::path::Path| {
+            fx::write_files(root, &[("package.json", package.to_string()), ("main.js", "module.exports = { x: 1 };\n".to_string())]).unwrap()
+        };
+        let left = write(&dir.path().join("left"));
+        let right = write(&dir.path().join("right"));
+        let e = Engine::new(crate::testing::session());
+        for tool in ["app_graphs_compare", "js_exports_compare"] {
+            let path = call(&e, tool, json!({"left": left.clone(), "right": right.clone()})).unwrap();
+            assert!(!path["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "source_map_unreadable"), "{tool} path inputs: {path}");
+        }
     }
 
     /// A comparison whose channel list is cut reports complete totals and partial coverage.

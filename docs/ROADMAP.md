@@ -2747,6 +2747,11 @@ Owner: open · Status: in progress
       summary reports the cut lengths as totals; report complete counts, mark `rows_capped`, and add
       partial coverage.
       — claimed: AlexJoaquimPereira, branch bugfix/r3.12-compare-row-totals
+- [ ] `app_graphs_compare` and `js_exports_compare` drop the loaded graph's analysis limitations
+      (a malformed source map, a truncated inventory, dynamic IPC names), so a comparison reads as
+      complete when a side was partial; carry each side's limitations into the comparison evidence
+      with left/right labels.
+      — claimed: AlexJoaquimPereira, branch bugfix/r3.12-compare-graph-limitations
 
 
 ### R3.13 Web inspection correctness
