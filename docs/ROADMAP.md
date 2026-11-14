@@ -844,6 +844,10 @@ Owner: open · Status: in progress
       have no file there)
 - [x] `ai test` names the program it ran and the saved one it replaced, and `doctor` says a saved
       path has no program there instead of blaming PATH (#721)
+- [x] `doctor` says "Several copies are on PATH" for one file reached twice, when a PATH folder
+      is a symlink to another (`/bin` -> `/usr/bin`, so both spell the same program, #1550):
+      compare where the copies really are before counting them
+      — claimed: muraa-p, branch bugfix/1550-doctor-symlink
 - [x] `doctor` looks a registration's bare command (`craft-anything-cli`, as a hand-made entry
       names it) up on PATH, as the app starting it does, instead of calling it missing.
       — claimed: Plastic-time, branch bugfix/r2.2-doctor-cli-on-path
