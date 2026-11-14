@@ -61,7 +61,10 @@ pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), ToolError> 
     write_impl(path, bytes, true)
 }
 
-/// Restrict a directory to its owner (0700 on Unix), for a folder holding private files.
+/// Restrict an existing, caller-selected private-data directory to its owner (0700 on Unix).
+/// This changes the supplied directory, including an existing custom config directory, not its
+/// ancestors. The caller must select a dedicated directory, not an unrelated shared folder.
+/// Returns an error if permissions cannot be set; does not create the directory.
 pub fn set_private_dir(dir: &Path) -> Result<(), ToolError> {
     #[cfg(unix)]
     {

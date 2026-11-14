@@ -476,7 +476,17 @@ impl Settings {
         Self::discard_pending(path)
     }
 
+    /// Save settings privately. A non-empty parent is treated as a dedicated config directory:
+    /// create it if needed and restrict it to 0700 on Unix before replacing the 0600 file.
+    /// This includes an existing directory selected by `CRAFT_ANYTHING_CONFIG_DIR`; callers must
+    /// not select an unrelated shared directory. Ancestors are not chmodded. A bare filename does
+    /// not change the working directory's permissions. Directory preparation failure leaves any
+    /// existing config file unchanged; directory creation/permission changes are not rolled back.
     pub fn save_to(&self, path: &Path) -> Result<(), ToolError> {
+        self.save_to_with_dir_permissions(path, craft_anything_platform::fs::set_private_dir)
+    }
+
+    fn save_to_with_dir_permissions(&self, path: &Path, set_private_dir: impl FnOnce(&Path) -> Result<(), ToolError>) -> Result<(), ToolError> {
         if let Some(why) = &self.not_loaded {
             return Err(ToolError::new(ErrorCode::BadSettings, format!("Settings weren't saved: {why}, so these are defaults standing in for it."))
                 .with_remediation("Nothing was written. Make that file readable or move it aside, then start Craft Anything again."));
@@ -491,11 +501,11 @@ impl Settings {
         let text = toml::to_string_pretty(self).map_err(|e| ToolError::new(ErrorCode::BadSettings, e.to_string()))?;
         // `config.toml` can hold plugin headers and environment (API keys), so it is owner-only,
         // as is the folder that holds it (audit: craft-anything #2).
-        craft_anything_platform::write_atomic_private(path, text.as_bytes())?;
         if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-            craft_anything_platform::set_private_dir(dir)?;
+            std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
+            set_private_dir(dir)?;
         }
-        Ok(())
+        craft_anything_platform::write_atomic_private(path, text.as_bytes())
     }
 
     pub fn save(&self) -> Result<(), ToolError> {
@@ -721,6 +731,61 @@ default = "Claude Code"
         let nested = dir.path().join("cfg").join("config.toml");
         Settings::default().save_to(&nested).unwrap();
         assert_eq!(std::fs::metadata(nested.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn directory_permission_failure_leaves_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let old = b"previous settings";
+        std::fs::write(&path, old).unwrap();
+        let changed = Settings { language: "de".into(), ..Settings::default() };
+        let error = changed
+            .save_to_with_dir_permissions(&path, |parent| {
+                assert_eq!(parent, dir.path());
+                assert_eq!(std::fs::read(&path).unwrap(), old);
+                Err(ToolError::io(parent.display(), std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected chmod refusal")))
+            })
+            .unwrap_err();
+        assert!(error.message.contains("injected chmod refusal"));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let new_path = dir.path().join("new-config").join("config.toml");
+        assert!(
+            changed
+                .save_to_with_dir_permissions(&new_path, |parent| {
+                    assert!(parent.is_dir());
+                    assert!(!new_path.exists());
+                    Err(ToolError::io(parent.display(), std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected chmod refusal")))
+                })
+                .is_err()
+        );
+        assert!(!new_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_selected_existing_config_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("selected-config");
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        for path in [root.path(), parent.as_path(), unrelated.as_path()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = parent.join("config.toml");
+        Settings::default()
+            .save_to_with_dir_permissions(&path, |dir| {
+                assert!(!path.exists(), "the file must not be written before securing its directory");
+                craft_anything_platform::fs::set_private_dir(dir)
+            })
+            .unwrap();
+        for (path, mode) in [(root.path(), 0o755), (parent.as_path(), 0o700), (unrelated.as_path(), 0o755), (path.as_path(), 0o600)] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, mode);
+        }
     }
 
     #[test]

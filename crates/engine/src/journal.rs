@@ -60,11 +60,7 @@ fn is_secret_field(name: &str) -> bool {
 /// `v` with the value of every secret-named field (at any depth) replaced by `"(redacted)"`.
 pub fn redacted(v: &Value) -> Value {
     match v {
-        Value::Object(m) => Value::Object(
-            m.iter()
-                .map(|(k, val)| (k.clone(), if is_secret_field(k) { json!("(redacted)") } else { redacted(val) }))
-                .collect(),
-        ),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, val)| (k.clone(), if is_secret_field(k) { json!("(redacted)") } else { redacted(val) })).collect()),
         Value::Array(a) => Value::Array(a.iter().map(redacted).collect()),
         other => other.clone(),
     }
