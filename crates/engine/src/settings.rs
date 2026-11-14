@@ -489,7 +489,13 @@ impl Settings {
             .with_remediation("Update Craft Anything to change settings, or move config.toml aside to start fresh. Nothing was written."));
         }
         let text = toml::to_string_pretty(self).map_err(|e| ToolError::new(ErrorCode::BadSettings, e.to_string()))?;
-        crate::project::write_atomic(path, text.as_bytes())
+        // `config.toml` can hold plugin headers and environment (API keys), so it is owner-only,
+        // as is the folder that holds it (audit: craft-anything #2).
+        craft_anything_platform::write_atomic_private(path, text.as_bytes())?;
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            craft_anything_platform::set_private_dir(dir)?;
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<(), ToolError> {
@@ -702,6 +708,19 @@ default = "Claude Code"
         assert_eq!(Settings::load_from(&path), Settings::default());
         assert!(path.with_extension("toml.broken").exists());
         assert!(read_settings("version = -1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_is_saved_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings::default().save_to(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let nested = dir.path().join("cfg").join("config.toml");
+        Settings::default().save_to(&nested).unwrap();
+        assert_eq!(std::fs::metadata(nested.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]
